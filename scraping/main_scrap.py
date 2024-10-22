@@ -1,59 +1,103 @@
-import sqlite3
+import pandas as pd
+from google.cloud import bigquery
+from google.oauth2 import service_account
 from apec_scrap import main_apec
 from wttj_scrap import main_wttj
 from cadreemploi_scrap import main_cadreemploi
 from hellowork_scrap import main_hellowork
 from freework_scrap import main_freework
-import pandas as pd
 
-def db_file_storage(db_name, table_name, df):
+class BigQueryStorage:
+    def __init__(self, project_id, credentials_path):
+        self.credentials = service_account.Credentials.from_service_account_file(
+            credentials_path
+        )
+        self.client = bigquery.Client(
+            credentials=self.credentials,
+            project=project_id
+        )
+        self.dataset_id = "job_scraping"
+        
+    def store_data(self, df, table_id):
+        table_ref = f"{self.client.project}.{self.dataset_id}.{table_id}"
+        
+        job_config = bigquery.LoadJobConfig(
+            write_disposition="WRITE_APPEND",
+        )
+        
+        try:
+            job = self.client.load_table_from_dataframe(
+                df, table_ref, job_config=job_config
+            )
+            job.result()
+            print(f"✓ {len(df)} lignes chargées dans {table_ref}")
+        except Exception as e:
+            print(f"⚠ Erreur lors du chargement vers BigQuery: {str(e)}")
 
-    # Connexion à la base de données SQLite
-    conn = sqlite3.connect(f"./data/{db_name}.db")
+    def get_data(self, table_id):
+        query = f"""
+        SELECT * 
+        FROM `{self.client.project}.{self.dataset_id}.{table_id}`
+        """
+        
+        try:
+            return self.client.query(query).to_dataframe()
+        except Exception as e:
+            print(f"⚠ Erreur lors de la récupération des données: {str(e)}")
+            return pd.DataFrame()
+
+def update(storage):
+    # Dictionnaire des sources avec leurs fonctions correspondantes
+    sources = {
+        'apec': main_apec,
+        'wttj': main_wttj,
+        'cadreemploi': main_cadreemploi,
+        'hellowork': main_hellowork,
+        'freework': main_freework
+    }
     
-    # Enregistrer le DataFrame dans la base de données
-    df.to_sql(name=table_name, con=conn, if_exists='append', index=False)
+    # Exécute le scraping pour chaque source
+    for source_name, scraping_function in sources.items():
+        try:
+            print(f"Scraping de {source_name}...")
+            df = scraping_function()
+            storage.store_data(df, f"{source_name}_jobs")
+        except Exception as e:
+            print(f"⚠ Erreur lors du scraping de {source_name}: {str(e)}")
+
+def concat_all_data(storage):
+    # Liste des sources
+    sources = ['apec', 'wttj', 'cadreemploi', 'hellowork', 'freework']
     
-    # Fermer la connexion
-    conn.close()
-
-def connect_db(file, table):
-    # Connectez-vous à la base de données
-    conn = sqlite3.connect(f"./data/{file}.db")
+    # Récupère les données de chaque source
+    dataframes = []
+    for source in sources:
+        df = storage.get_data(f"{source}_jobs")
+        if not df.empty:
+            dataframes.append(df)
     
-    # Supposez que vous voulez lire une table nommée 'nom_table'
-    table_name = table
-    df = pd.read_sql_query(f"SELECT * FROM {table_name}", conn)
-    conn.close()
-    return df
+    # Concatène tous les DataFrames
+    if dataframes:
+        df_all = pd.concat(dataframes).reset_index(drop=True)
+        
+        # Stocke le résultat dans BigQuery
+        storage.store_data(df_all, "all_jobs")
+        
+        # Sauvegarde optionnelle en CSV local pour backup
+        df_all.to_csv('./data/database.csv', index=False)
+        print("✓ Données combinées sauvegardées avec succès")
+    else:
+        print("⚠ Aucune donnée à combiner")
 
-def update():
-
-    df_apec = main_apec()
-    db_file_storage('apec', 'df_clean', df_apec)
-
-    df_wttj = main_wttj()
-    db_file_storage('wttj', 'df_clean', df_wttj)
-
-    df_cadreemploi = main_cadreemploi()
-    db_file_storage('cadreemploi', 'df_clean', df_cadreemploi)
-
-    df_hellowork = main_hellowork()
-    db_file_storage('hellowork', 'df_clean', df_hellowork)
-
-    df_freework = main_freework()
-    db_file_storage('freework', 'df_clean', df_freework)
-
-
-
-def concat_all_df():
-    df_apec = connect_db('apec', 'df_clean')
-    df_wttj = connect_db('wttj', 'df_clean')
-    df_cadreemploi = connect_db('cadreemploi', 'df_clean')
-    df_hellowork = connect_db('hellowork', 'df_clean')
-    df_freework = connect_db('freework', 'df_clean')
-
-    df_all = pd.concat([df_apec, df_wttj, df_cadreemploi, df_hellowork, df_freework]).reset_index(drop=True)
-    db_file_storage('database', 'df_all', df_all)
-    df_all.to_csv('./data/database.csv', index = False)
-
+if __name__ == "__main__":
+    # Configuration du stockage
+    storage = BigQueryStorage(
+        project_id="data-job",  # 
+        credentials_path="./credentials.json"
+    )
+    
+    # Exécution du pipeline
+    print("Démarrage de la mise à jour des données...")
+    update(storage)
+    print("\nConcaténation des données...")
+    concat_all_data(storage)
